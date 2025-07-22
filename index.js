@@ -4,11 +4,11 @@ import cors from "cors";
 import bodyParser from "body-parser";
 import { GoogleGenAI } from "@google/genai";
 
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 const app = express();
 app.use(cors());
 app.use(bodyParser.json({ limit: "2mb" }));
-
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 console.log("GEMINI_API_KEY:", GEMINI_API_KEY);
 app.post("/api/tts", async (req, res) => {
@@ -16,8 +16,7 @@ app.post("/api/tts", async (req, res) => {
     const { text, voiceName = "Kore" } = req.body;
     if (!text) return res.status(400).json({ error: "Missing text" });
 
-    const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-
+    const t0 = Date.now();
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash-preview-tts",
       contents: [{ parts: [{ text }] }],
@@ -30,6 +29,8 @@ app.post("/api/tts", async (req, res) => {
         },
       },
     });
+    const t1 = Date.now();
+    console.log(`[TTS] Gemini API call took ${(t1 - t0) / 1000}s`);
 
     const data =
       response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
@@ -83,6 +84,12 @@ app.post("/api/tts", async (req, res) => {
       "Content-Disposition": 'attachment; filename="output.wav"',
       "Content-Length": wavBuffer.length,
     });
+    const t2 = Date.now();
+    console.log(
+      `[TTS] Response sent in ${(t2 - t1) / 1000}s (total: ${
+        (t2 - t0) / 1000
+      }s)`
+    );
     // Send the WAV buffer as binary
     res.send(wavBuffer);
   } catch (err) {
