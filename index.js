@@ -1,103 +1,204 @@
 import "dotenv/config";
-import express from "express";
-import cors from "cors";
-import bodyParser from "body-parser";
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, Modality } from "@google/genai";
+import http from "http";
+import { WebSocketServer } from "ws";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-const app = express();
-app.use(cors());
-app.use(bodyParser.json({ limit: "2mb" }));
 
-console.log("GEMINI_API_KEY:", GEMINI_API_KEY);
-app.post("/api/tts", async (req, res) => {
-  try {
-    const { text, voiceName = "Kore" } = req.body;
-    if (!text) return res.status(400).json({ error: "Missing text" });
+// Create lightweight HTTP server optimized for WebSocket only
+const server = http.createServer();
 
-    const t0 = Date.now();
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash-preview-tts",
-      contents: [{ parts: [{ text }] }],
-      config: {
-        responseModalities: ["AUDIO"],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName },
-          },
-        },
-      },
-    });
-    const t1 = Date.now();
-    console.log(`[TTS] Gemini API call took ${(t1 - t0) / 1000}s`);
+// High-performance WebSocket server for real-time TTS streaming
+const wss = new WebSocketServer({ server });
 
-    const data =
-      response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    if (!data)
-      return res.status(500).json({ error: "No audio returned from Gemini" });
+wss.on("connection", (ws) => {
+  console.log("[WS] New client connected");
 
-    // Decode base64 to Buffer (LINEAR16 PCM)
-    const pcmBuffer = Buffer.from(data, "base64");
+  ws.on("message", async (message) => {
+    try {
+      const data = JSON.parse(message.toString());
+      const { text } = data;
 
-    // WAV header parameters
-    const numChannels = 1; // mono
-    const sampleRate = 24000; // Gemini TTS default is 24kHz
-    const bitsPerSample = 16;
-    const byteRate = (sampleRate * numChannels * bitsPerSample) / 8;
-    const blockAlign = (numChannels * bitsPerSample) / 8;
-    const wavHeader = Buffer.alloc(44);
+      if (!text || typeof text !== "string") {
+        ws.send(JSON.stringify({ error: "Missing or invalid text" }));
+        return;
+      }
 
-    // ChunkID 'RIFF'
-    wavHeader.write("RIFF", 0);
-    // ChunkSize (file size - 8)
-    wavHeader.writeUInt32LE(36 + pcmBuffer.length, 4);
-    // Format 'WAVE'
-    wavHeader.write("WAVE", 8);
-    // Subchunk1ID 'fmt '
-    wavHeader.write("fmt ", 12);
-    // Subchunk1Size (16 for PCM)
-    wavHeader.writeUInt32LE(16, 16);
-    // AudioFormat (1 = PCM)
-    wavHeader.writeUInt16LE(1, 20);
-    // NumChannels
-    wavHeader.writeUInt16LE(numChannels, 22);
-    // SampleRate
-    wavHeader.writeUInt32LE(sampleRate, 24);
-    // ByteRate
-    wavHeader.writeUInt32LE(byteRate, 28);
-    // BlockAlign
-    wavHeader.writeUInt16LE(blockAlign, 32);
-    // BitsPerSample
-    wavHeader.writeUInt16LE(bitsPerSample, 34);
-    // Subchunk2ID 'data'
-    wavHeader.write("data", 36);
-    // Subchunk2Size (pcm data length)
-    wavHeader.writeUInt32LE(pcmBuffer.length, 40);
+      console.log(`[WS] Processing TTS for: "${text.substring(0, 50)}..."`);
+      await handleLiveStreamingTTS(ws, text);
+    } catch (e) {
+      console.error("[WS] Error processing message:", e.message);
+      ws.send(JSON.stringify({ error: "Invalid message format" }));
+    }
+  });
 
-    // Concatenate header + PCM data
-    const wavBuffer = Buffer.concat([wavHeader, pcmBuffer]);
+  ws.on("close", () => {
+    console.log("[WS] Client disconnected");
+  });
 
-    // Set headers for WAV file download
-    res.set({
-      "Content-Type": "audio/wav",
-      "Content-Disposition": 'attachment; filename="output.wav"',
-      "Content-Length": wavBuffer.length,
-    });
-    const t2 = Date.now();
-    console.log(
-      `[TTS] Response sent in ${(t2 - t1) / 1000}s (total: ${
-        (t2 - t0) / 1000
-      }s)`
-    );
-    // Send the WAV buffer as binary
-    res.send(wavBuffer);
-  } catch (err) {
-    res.status(500).json({ error: "TTS failed", details: err.message });
-  }
+  ws.on("error", (error) => {
+    console.error("[WS] WebSocket error:", error);
+  });
 });
 
+async function handleLiveStreamingTTS(ws, text) {
+  const responseQueue = [];
+  let session;
+
+  // Check if we should use mock mode for testing
+  const USE_MOCK_MODE = !GEMINI_API_KEY || GEMINI_API_KEY.includes('your-api-key') || process.env.MOCK_MODE === 'true';
+
+  if (USE_MOCK_MODE) {
+    console.log("[MOCK] Using mock TTS response for testing");
+    
+    // Send status
+    ws.send(JSON.stringify({ type: "status", message: "connected" }));
+    
+    // Simulate processing delay
+    setTimeout(() => {
+      // Send mock audio response
+      const mockResponse = `Thank you for saying: "${text}". This is a mock response while your Gemini API is being configured.`;
+      
+      ws.send(JSON.stringify({
+        type: "complete",
+        totalChunks: 0,
+        mockResponse: mockResponse
+      }));
+    }, 1000);
+    
+    return;
+  }
+
+  function waitMessage(timeoutMs = 30000) {
+    return new Promise((resolve, reject) => {
+      const start = Date.now();
+      const check = () => {
+        if (responseQueue.length > 0) {
+          resolve(responseQueue.shift());
+        } else if (Date.now() - start > timeoutMs) {
+          reject(new Error("Timeout waiting for Gemini response"));
+        } else {
+          setTimeout(check, 10); // Reduced interval for better responsiveness
+        }
+      };
+      check();
+    });
+  }
+
+  async function streamAudioToClient() {
+    let done = false;
+    let chunkCount = 0;
+
+    try {
+      while (!done) {
+        const message = await waitMessage();
+
+        // Forward audio chunks immediately to minimize latency
+        if (message.data) {
+          chunkCount++;
+          ws.send(
+            JSON.stringify({
+              type: "audio",
+              data: message.data,
+              chunk: chunkCount,
+            })
+          );
+        }
+
+        if (message.serverContent && message.serverContent.turnComplete) {
+          done = true;
+          ws.send(
+            JSON.stringify({
+              type: "complete",
+              totalChunks: chunkCount,
+            })
+          );
+        }
+      }
+    } catch (err) {
+      console.error("[WS] Streaming error:", err.message);
+      ws.send(
+        JSON.stringify({
+          type: "error",
+          error: err.message,
+        })
+      );
+    }
+  }
+
+  try {
+    // Check if API key is available and try to connect
+    if (!GEMINI_API_KEY || GEMINI_API_KEY === "your-api-key-here") {
+      throw new Error("No valid API key configured");
+    }
+
+    session = await ai.live.connect({
+      model: "gemini-2.5-flash-preview-native-audio-dialog",
+      callbacks: {
+        onopen: () => {
+          console.log("[Gemini] Live session opened");
+          ws.send(JSON.stringify({ type: "status", message: "connected" }));
+        },
+        onmessage: (message) => {
+          responseQueue.push(message);
+        },
+        onerror: (e) => {
+          console.error("[Gemini] Live session error:", e.message);
+          ws.send(
+            JSON.stringify({
+              type: "error",
+              error: `Gemini API error: ${e.message}`,
+            })
+          );
+        },
+        onclose: (e) => {
+          console.log("[Gemini] Live session closed:", e?.reason);
+        },
+      },
+      config: {
+        responseModalities: [Modality.AUDIO],
+        systemInstruction:
+          "You are a helpful assistant. Respond in a friendly, conversational tone.",
+      },
+    });
+
+    // Send text to Gemini and start streaming
+    session.sendRealtimeInput({ text });
+    await streamAudioToClient();
+  } catch (error) {
+    console.error("[WS] Failed to establish Gemini session:", error.message);
+
+    // Send a more informative error message
+    let errorMessage = error.message;
+    if (error.message.includes("quota") || error.message.includes("billing")) {
+      errorMessage =
+        "Gemini API quota exceeded. Please check your billing and quota limits.";
+    } else if (error.message.includes("API key")) {
+      errorMessage =
+        "Invalid or missing Gemini API key. Please check your .env file.";
+    }
+
+    ws.send(
+      JSON.stringify({
+        type: "error",
+        error: errorMessage,
+      })
+    );
+  } finally {
+    if (session) {
+      session.close();
+    }
+  }
+}
+
+console.log("GEMINI_API_KEY configured:", GEMINI_API_KEY ? "✓" : "✗");
+
 const PORT = process.env.PORT || 4300;
-app.listen(PORT, () => {
-  console.log(`Gemini TTS server listening on port ${PORT}`);
+server.listen(PORT, () => {
+  console.log(
+    `🚀 High-performance TTS WebSocket server running on port ${PORT}`
+  );
+  console.log(`📡 WebSocket endpoint: ws://localhost:${PORT}`);
+  console.log(`🎤 Ready for real-time audio streaming!`);
 });
